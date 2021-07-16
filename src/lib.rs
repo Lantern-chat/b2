@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use serde::Deserialize;
+use headers::{ContentLength, ContentType, HeaderMapExt};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use hyper::{
     client::{Client, HttpConnector},
@@ -16,9 +17,17 @@ pub struct B2ClientSession {
     pub session: B2Session,
 }
 
+impl Deref for B2ClientSession {
+    type Target = B2Session;
+
+    fn deref(&self) -> &B2Session {
+        &self.session
+    }
+}
+
 #[derive(Clone)]
 pub struct B2Client {
-    pub client: HttpsClient,
+    inner: HttpsClient,
     pub session: Arc<B2ClientSession>,
 }
 
@@ -26,6 +35,7 @@ pub struct B2Client {
 pub struct B2ClientConfig {
     pub app_id: String,
     pub app_key: String,
+    pub bucket: String,
 }
 
 impl B2ClientConfig {
@@ -117,11 +127,17 @@ pub enum B2Error {
     #[error("Json Error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("Url-encoding Error: {0}")]
+    UrlEncoded(#[from] serde_urlencoded::ser::Error),
+
     #[error("B2 Failure: {0:?}")]
     Failure(B2ErrorMessage),
 
     #[error("Server Error: {0}")]
     ServerError(StatusCode),
+
+    #[error("Specified bucket is not allowed")]
+    BucketNotAllowed,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +145,27 @@ pub struct B2ErrorMessage {
     pub status: u16,
     pub code: String,
     pub message: String,
+}
+
+use bytes::{Buf, Bytes};
+use futures::Stream;
+
+async fn aggregate_body(body: &mut Body) -> Result<impl Buf, hyper::Error> {
+    hyper::body::aggregate(std::mem::replace(body, Body::empty())).await
+}
+
+async fn parse_body<T: DeserializeOwned>(status: StatusCode, body: &mut Body) -> Result<T, B2Error> {
+    if status.is_server_error() {
+        return Err(B2Error::ServerError(status));
+    }
+
+    let bytes = aggregate_body(body).await?;
+
+    if status.is_client_error() {
+        Err(B2Error::Failure(serde_json::from_reader(bytes.reader())?))
+    } else {
+        Ok(serde_json::from_reader(bytes.reader())?)
+    }
 }
 
 impl B2Client {
@@ -143,29 +180,77 @@ impl B2Client {
             )
             .await?;
 
-        let status = auth_res.status();
+        let session: B2Session = parse_body(auth_res.status(), auth_res.body_mut()).await?;
 
-        if status.is_server_error() {
-            return Err(B2Error::ServerError(status));
+        if session.allowed.bucket_name.is_none()
+            || session.allowed.bucket_name.as_ref() != Some(&config.bucket)
+        {
+            return Err(B2Error::BucketNotAllowed);
         }
-
-        let body = aggregate_body(auth_res.body_mut()).await?.reader();
-
-        if status.is_client_error() {
-            return Err(B2Error::Failure(serde_json::from_reader(body)?));
-        }
-
-        let session = serde_json::from_reader(body)?;
 
         Ok(B2Client {
-            client,
+            inner: client,
             session: Arc::new(B2ClientSession { config, session }),
+        })
+    }
+
+    pub async fn get_upload(&self) -> Result<B2Upload, B2Error> {
+        #[derive(Serialize)]
+        struct GetUploadUrlParams<'a> {
+            #[serde(rename = "bucketId")]
+            bucket_id: &'a str,
+        }
+
+        let body = Body::from(serde_urlencoded::to_string(&GetUploadUrlParams {
+            bucket_id: &self.session.allowed.bucket_id.as_ref().unwrap(),
+        })?);
+
+        let mut get_upload_url_request =
+            Request::post(format!("{}/b2api/v2/b2_get_upload_url", self.session.api_url))
+                .header("Authorization", &self.session.auth_token);
+
+        let headers = get_upload_url_request.headers_mut().unwrap();
+        headers.typed_insert(ContentType::form_url_encoded());
+
+        let mut result = self.inner.request(get_upload_url_request.body(body)?).await?;
+
+        let upload_url = parse_body(result.status(), result.body_mut()).await?;
+
+        Ok(B2Upload {
+            client: self.clone(),
+            upload_url,
         })
     }
 }
 
-use bytes::Buf;
+#[derive(Deserialize)]
+struct GetUploadUrlResult {
+    #[serde(rename = "bucketId")]
+    bucket_id: String,
+    #[serde(rename = "uploadUrl")]
+    upload_url: String,
+    #[serde(rename = "authorizationToken")]
+    authorization_token: String,
+}
 
-async fn aggregate_body(body: &mut Body) -> Result<impl Buf, hyper::Error> {
-    hyper::body::aggregate(std::mem::replace(body, Body::empty())).await
+pub struct B2Upload {
+    client: B2Client,
+    upload_url: GetUploadUrlResult,
+}
+
+impl B2Upload {
+    pub async fn upload(
+        self,
+        path: &str,
+        sha1: &[u8; 20],
+        length: u64,
+        stream: impl Stream<Item = Bytes>,
+    ) -> Result<(), B2Error> {
+        let encoded_name = urlencoding::encode(&path);
+        let encoded_sha1 = base64::encode(sha1);
+
+        //headers.typed_insert(ContentLength(length));
+
+        Ok(())
+    }
 }
